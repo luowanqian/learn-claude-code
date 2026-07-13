@@ -145,6 +145,8 @@ python s03_permission/code.py
 
 观察重点：哪些操作直接通过？哪些需要你确认？哪些被直接拒绝？
 
+Note20260713：实操下来，Prompt 2在多次拒绝LLM后，LLM会写一段Python代码绕过权限检查，顺利删除文件
+
 ---
 
 ## 接下来

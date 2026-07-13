@@ -1,19 +1,34 @@
 #!/usr/bin/env python3
 """
-s02: Tool Use — 在 s01 基础上新增 4 个工具 + 分发映射。
+s03_permission.py - Permission System
 
-运行: python s02_tool_use/code.py
-需要: pip install anthropic python-dotenv + .env 中配置 ANTHROPIC_API_KEY
+Three gates inserted before tool execution:
 
-本文件 = s01 的全部代码 + 以下新增:
-  + run_read / run_write / run_edit / run_glob 四个工具实现
-  + TOOL_HANDLERS 分发映射（替代 s01 中硬编码的 run_bash 调用）
-  + safe_path 路径安全校验
+    Gate 1: Hard deny list (rm -rf /, sudo, ...)
+    Gate 2: Rule matching (write outside workspace? destructive cmd?)
+    Gate 3: User approval (pause and wait for confirmation)
 
-循环本身（agent_loop）与 s01 完全一致。
+    +-------+    +--------+    +--------+    +--------+    +------+
+    | Tool  | -> | Gate 1 | -> | Gate 2 | -> | Gate 3 | -> | Exec |
+    | call  |    | deny?  |    | match? |    | allow? |    |      |
+    +-------+    +--------+    +--------+    +--------+    +------+
+         |            |             |             |
+         v            v             v             v
+      (normal)     (blocked)    (ask user)   (user says no?)
+
+Only one line added to the agent loop:
+
+    if not check_permission(block):
+        continue
+
+Builds on s02 (multi-tool). Usage:
+
+    python s03_permission/code.py
+    Needs: pip install anthropic python-dotenv + ANTHROPIC_API_KEY in .env
 """
 
-import os, subprocess, json
+import os, subprocess
+import json
 from pathlib import Path
 
 try:
@@ -38,31 +53,11 @@ client = OpenAI(
 )
 MODEL = os.environ["MODEL_ID"]
 
-SYSTEM = f"You are a coding agent at {WORKDIR}. Use tools to solve tasks. Act, don't explain."
+SYSTEM = f"You are a coding agent at {WORKDIR}. All destructive operations require user approval."
 
 
 # ═══════════════════════════════════════════════════════════
-#  FROM s01 (unchanged)
-# ═══════════════════════════════════════════════════════════
-
-def run_bash(command: str) -> str:
-    dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
-    if any(d in command for d in dangerous):
-        return "Error: Dangerous command blocked"
-    try:
-        r = subprocess.run(command, shell=True, cwd=WORKDIR,
-                           capture_output=True, text=True,
-                           encoding="utf-8", errors="replace", timeout=120)
-        out = (r.stdout + r.stderr).strip()
-        return out[:50000] if out else "(no output)"
-    except subprocess.TimeoutExpired:
-        return "Error: Timeout (120s)"
-    except (FileNotFoundError, OSError) as e:
-        return f"Error: {e}"
-
-
-# ═══════════════════════════════════════════════════════════
-#  NEW in s02: 4 个新工具
+#  FROM s02 (unchanged): Tool Implementations
 # ═══════════════════════════════════════════════════════════
 
 def safe_path(p: str) -> Path:
@@ -70,6 +65,17 @@ def safe_path(p: str) -> Path:
     if not path.is_relative_to(WORKDIR):
         raise ValueError(f"Path escapes workspace: {p}")
     return path
+
+
+def run_bash(command: str) -> str:
+    try:
+        # print(f"Cmd: {command}")
+        r = subprocess.run(command, shell=True, cwd=WORKDIR,
+                           capture_output=True, text=True, timeout=120)
+        out = (r.stdout + r.stderr).strip()
+        return out[:50000] if out else "(no output)"
+    except subprocess.TimeoutExpired:
+        return "Error: Timeout (120s)"
 
 
 def run_read(path: str, limit: int | None = None) -> str:
@@ -117,7 +123,7 @@ def run_glob(pattern: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════
-#  NEW in s02: 工具定义（s01 只有一个 bash，现在扩展到 5 个）
+#  FROM s02 (unchanged): Tool Definitions & Dispatch
 # ═══════════════════════════════════════════════════════════
 
 TOOLS = [
@@ -215,10 +221,6 @@ TOOLS = [
     },
 ]
 
-# ═══════════════════════════════════════════════════════════
-#  NEW in s02: 工具分发映射（s01 是硬编码 run_bash，现在改为查表）
-# ═══════════════════════════════════════════════════════════
-
 TOOL_HANDLERS = {
     "bash": run_bash, "read_file": run_read, "write_file": run_write,
     "edit_file": run_edit, "glob": run_glob,
@@ -226,9 +228,61 @@ TOOL_HANDLERS = {
 
 
 # ═══════════════════════════════════════════════════════════
-#  agent_loop — 与 s01 结构完全一致，只改了工具执行那部分
-#  s01: output = run_bash(block.input["command"])
-#  s02: output = TOOL_HANDLERS[block.name](**block.input)
+#  NEW in s03: Three-Gate Permission Pipeline
+# ═══════════════════════════════════════════════════════════
+
+# Gate 1: Hard deny list — always forbidden
+DENY_LIST = ["rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if=", "> /dev/sda"]
+
+def check_deny_list(command: str) -> str | None:
+    for pattern in DENY_LIST:
+        if pattern in command:
+            return f"Blocked: '{pattern}' is on the deny list"
+    return None
+
+
+# Gate 2: Rule matching — context-dependent checks
+PERMISSION_RULES = [
+    {"tools": ["write_file", "edit_file"],
+     "check": lambda args: not (WORKDIR / args.get("path", "")).resolve().is_relative_to(WORKDIR),
+     "message": "Writing outside workspace"},
+    {"tools": ["bash"],
+     "check": lambda args: any(kw in args.get("command", "") for kw in ["rm ", "> /etc/", "chmod 777"]),
+     "message": "Potentially destructive command"},
+]
+
+def check_rules(tool_name: str, args: dict) -> str | None:
+    for rule in PERMISSION_RULES:
+        if tool_name in rule["tools"] and rule["check"](args):
+            return rule["message"]
+    return None
+
+
+# Gate 3: User approval — wait for confirmation after rule match
+def ask_user(tool_name: str, args: dict, reason: str) -> str:
+    print(f"\n\033[33m⚠  {reason}\033[0m")
+    print(f"   Tool: {tool_name}({args})")
+    choice = input("   Allow? [y/N] ").strip().lower()
+    return "allow" if choice in ("y", "yes") else "deny"
+
+
+# Pipeline: all three gates chained
+def check_permission(tool_name, tool_args) -> bool:
+    if tool_name == "bash":
+        reason = check_deny_list(tool_args.get("command", ""))
+        if reason:
+            print(f"\n\033[31m⛔ {reason}\033[0m")
+            return False
+    reason = check_rules(tool_name, tool_args)
+    if reason:
+        decision = ask_user(tool_name, tool_args, reason)
+        if decision == "deny":
+            return False
+    return True
+
+
+# ═══════════════════════════════════════════════════════════
+#  agent_loop — same as s02, with check_permission() inserted
 # ═══════════════════════════════════════════════════════════
 
 def agent_loop(messages: list):
@@ -251,7 +305,14 @@ def agent_loop(messages: list):
         for tool_call in response.tool_calls:
             tool_name = tool_call.function.name
             tool_args = json.loads(tool_call.function.arguments)
-            print(f"\033[33m> {tool_name}\033[0m")
+            print(f"\033[36m> {tool_name}\033[0m")
+
+            # s03 change: run through permission pipeline before executing
+            if not check_permission(tool_name, tool_args):
+                messages.append({"role": "tool", "tool_call_id": tool_call.id,
+                                 "content": "Permission denied."})
+                continue
+
             handler = TOOL_HANDLERS.get(tool_name)
             output = handler(**tool_args) if handler else f"Unknown: {tool_name}"
             print(str(output)[:200])
@@ -261,13 +322,13 @@ def agent_loop(messages: list):
 
 
 if __name__ == "__main__":
-    print("s02: Tool Use — 在 s01 基础上加了 4 个工具")
+    print("s03: Permission")
     print("输入问题，回车发送。输入 q 退出。\n")
 
     history = []
     while True:
         try:
-            query = input("\033[36ms02 >> \033[0m")
+            query = input("\033[36ms03 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", ""):
