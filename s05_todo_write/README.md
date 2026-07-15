@@ -124,6 +124,8 @@ python s05_todo_write/code.py
 
 观察重点：第一次工具调用是不是 `todo_write`？TODO 列了几步？执行过程中状态有没有从 `pending` 变成 `in_progress` / `completed`？
 
+Note20260715: 实际执行后发现一些现象：（1）第一次工具调用不一定是`todo_write`，有概率出现执行完所有流程后才打印todo list，可能和调用的模型（测试时用的是deepseek-v4-flash）有关？（2）有概率模型会在一个round内执行多个tool，而不是一个round执行一个tool，导致`todo_write`没触发
+
 ---
 
 ## 接下来
