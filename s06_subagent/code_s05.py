@@ -1,30 +1,30 @@
 #!/usr/bin/env python3
 """
-s06: Subagent — spawn sub-agents with fresh messages[] for context isolation.
+s05: TodoWrite — add a planning tool on top of s04 hooks.
 
-  Parent Agent                           Subagent
-  +------------------+                  +------------------+
-  | messages=[...]   |                  | messages=[task]  | <-- fresh
-  |                  |   dispatch       |                  |
-  | tool: task       | ---------------> | own while loop   |
-  |   prompt="..."   |                  |   bash/read/...  |
-  |                  |   summary only   |   (max 30 turns) |
-  | result = "..."   | <--------------- | return last text |
-  +------------------+                  +------------------+
-        ^                                      |
-        |       intermediate results DISCARDED  |
-        +--------------------------------------+
+  +---------+      +-------+      +------------------+
+  |  User   | ---> |  LLM  | ---> | TOOL_HANDLERS    |
+  | prompt  |      |       |      |  bash            |
+  +---------+      +---+---+      |  read_file       |
+                        ^         |  write_file      |
+                        | result  |  edit_file       |
+                        +---------+  glob            |
+                                      todo_write ← NEW
+                                   +------------------+
+                                        |
+                         in-memory current_todos
+                                        |
+                        if rounds_since_todo >= 3:
+                          inject <reminder>
 
-  Subagent tools: bash, read, write, edit, glob (NO task — no recursion)
+Changes from s04:
+  + todo_write tool + run_todo_write() implementation
+  + Nag reminder (inject reminder after 3 rounds without todo update)
+  + SYSTEM prompt includes "plan before execute" guidance
+  + rounds_since_todo counter in agent_loop
+  Loop unchanged: new tool auto-dispatches via TOOL_HANDLERS.
 
-Changes from s05:
-  + task tool + spawn_subagent() with fresh messages[]
-  + Safety limit: max 30 turns per subagent
-  + extract_text() helper
-  Subagent cannot spawn sub-subagents (no task tool in sub_tools).
-  Main loop unchanged: task auto-dispatches via TOOL_HANDLERS.
-
-Run: python s06_subagent/code.py
+Run: python s05_todo_write/code.py
 Needs: pip install anthropic python-dotenv + ANTHROPIC_API_KEY in .env
 """
 
@@ -63,7 +63,7 @@ SUB_SYSTEM = (
 
 
 # ═══════════════════════════════════════════════════════════
-#  FROM s02-s05 (unchanged): Tool Implementations
+#  FROM s02-s04 (unchanged): Tool Implementations
 # ═══════════════════════════════════════════════════════════
 
 def safe_path(p: str) -> Path:
@@ -121,6 +121,11 @@ def run_glob(pattern: str) -> str:
     except Exception as e:
         return f"Error: {e}"
 
+
+# ═══════════════════════════════════════════════════════════
+#  NEW in s05: todo_write tool — plan only, no execution
+# ═══════════════════════════════════════════════════════════
+
 def _normalize_todos(todos):
     if isinstance(todos, str):
         try:
@@ -165,8 +170,13 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
     {"name": "glob", "description": "Find files matching a glob pattern.",
      "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}},
+    # s05: new tool
     {"name": "todo_write", "description": "Create and manage a task list for your current coding session.",
      "input_schema": {"type": "object", "properties": {"todos": {"type": "array", "items": {"type": "object", "properties": {"content": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}}, "required": ["content", "status"]}}}, "required": ["todos"]}},
+    # s06: 新增 task 工具
+    {"name": "task",
+     "description": "Launch a subagent to handle a complex subtask. Returns only the final conclusion.",
+     "input_schema": {"type": "object", "properties": {"description": {"type": "string"}}, "required": ["description"]}},
 ]
 
 TOOL_HANDLERS = {
@@ -174,16 +184,15 @@ TOOL_HANDLERS = {
     "edit_file": run_edit, "glob": run_glob, "todo_write": run_todo_write,
 }
 
-
 # ═══════════════════════════════════════════════════════════
-#  NEW in s06: Subagent — fresh messages[], summary only
+#  NEW in s06: Subagent tools
 # ═══════════════════════════════════════════════════════════
 
 SUB_TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
      "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
     {"name": "read_file", "description": "Read file contents.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
+     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}},
     {"name": "write_file", "description": "Write content to a file.",
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
     {"name": "edit_file", "description": "Replace exact text in a file once.",
@@ -191,72 +200,11 @@ SUB_TOOLS = [
     {"name": "glob", "description": "Find files matching a glob pattern.",
      "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}},
 ]
-# NO "task" tool — prevent recursive spawning
 
-SUB_HANDLERS = {
+SUB_TOOL_HANDLERS = {
     "bash": run_bash, "read_file": run_read, "write_file": run_write,
     "edit_file": run_edit, "glob": run_glob,
 }
-
-def extract_text(content) -> str:
-    """Extract text from message content blocks."""
-    if not isinstance(content, list):
-        return str(content)
-    return "\n".join(getattr(b, "text", "") for b in content if getattr(b, "type", None) == "text")
-
-def spawn_subagent(description: str) -> str:
-    """Spawn a subagent with fresh messages[], return summary only."""
-    print(f"\n\033[35m[Subagent spawned]\033[0m")
-    messages = [{"role": "user", "content": description}]  # fresh context
-
-    for _ in range(30):  # safety limit
-        response = client.messages.create(
-            model=MODEL, system=SUB_SYSTEM,
-            messages=messages, tools=SUB_TOOLS, max_tokens=8000,
-        )
-        messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
-            break
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                # Issue 1: subagent also runs hooks (permissions apply)
-                blocked = trigger_hooks("PreToolUse", block)
-                if blocked:
-                    results.append({"type": "tool_result", "tool_use_id": block.id,
-                                    "content": str(blocked)})
-                    continue
-                handler = SUB_HANDLERS.get(block.name)
-                output = handler(**block.input) if handler else f"Unknown: {block.name}"
-                trigger_hooks("PostToolUse", block, output)
-                print(f"  \033[90m[sub] {block.name}: {str(output)[:100]}\033[0m")
-                results.append({"type": "tool_result", "tool_use_id": block.id,
-                                "content": output})
-        messages.append({"role": "user", "content": results})
-
-    # Issue 5: fallback if safety limit hit during tool_use
-    result = extract_text(messages[-1]["content"])
-    if not result:
-        # last message is tool_result, look backwards for assistant text
-        for msg in reversed(messages):
-            if msg["role"] == "assistant":
-                result = extract_text(msg["content"])
-                if result:
-                    break
-        if not result:
-            result = "Subagent stopped after 30 turns without final answer."
-    print(f"\033[35m[Subagent result]: {result}\033[0m")
-    print(f"\033[35m[Subagent done]\033[0m")
-    return result  # only summary, entire message history discarded
-
-# Add task tool to parent's tools
-TOOLS.append({
-    "name": "task",
-    "description": "Launch a subagent to handle a complex subtask. Returns only the final conclusion.",
-    "input_schema": {"type": "object", "properties": {"description": {"type": "string"}}, "required": ["description"]},
-})
-TOOL_HANDLERS["task"] = spawn_subagent
-
 
 # ═══════════════════════════════════════════════════════════
 #  FROM s04 (unchanged): Hook System
@@ -274,6 +222,7 @@ def trigger_hooks(event: str, *args):
             return result
     return None
 
+# s04 hooks preserved
 DENY_LIST = ["rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if="]
 
 def permission_hook(block):
@@ -287,7 +236,7 @@ def permission_hook(block):
 
 def log_hook(block):
     """PreToolUse: log tool calls."""
-    print(f"\033[90m[HOOK] {block.name}\033[0m")
+    print(f"\033[90m[HOOK] {block.name}({block.input})\033[0m")
     return None
 
 def context_inject_hook(query: str):
@@ -308,9 +257,53 @@ register_hook("PreToolUse", permission_hook)
 register_hook("PreToolUse", log_hook)
 register_hook("Stop", summary_hook)
 
-
 # ═══════════════════════════════════════════════════════════
-#  agent_loop — same as s05 + nag reminder, task auto-dispatches
+#  NEW in s06: Subagent loop
+# ═══════════════════════════════════════════════════════════
+def extract_text(contents):
+    for block in contents:
+        if getattr(block, "type", None) == "text":
+            return block.text
+    return "Nothing"
+
+
+def spawn_subagent(description: str) -> str:
+    print(f"\n\033[35m[Subagent spawned]\033[0m")
+    messages = [{"role": "user", "content": description}]  # 全新 messages[]
+
+    for _ in range(30):  # safety limit
+        response = client.messages.create(
+            model=MODEL, system=SUB_SYSTEM,
+            messages=messages, tools=SUB_TOOLS, max_tokens=8000,
+        )
+        messages.append({"role": "assistant", "content": response.content})
+        if response.stop_reason != "tool_use":
+            break
+        results = []
+        for block in response.content:
+            if block.type == "tool_use":
+                blocked = trigger_hooks("PreToolUse", block)
+                if blocked:
+                    results.append({"type": "tool_result", "tool_use_id": block.id,
+                                    "content": str(blocked)})
+                    continue
+                handler = SUB_TOOL_HANDLERS.get(block.name)
+                output = handler(**block.input) if handler else f"Unknown"
+                trigger_hooks("PostToolUse", block, output)
+                results.append({"type": "tool_result", "tool_use_id": block.id,
+                                "content": output})
+        messages.append({"role": "user", "content": results})
+
+    # 只返回最后的文本结论，中间过程全部丢弃
+    result = extract_text(messages[-1]["content"])
+    print(f"\033[35m[Subagent result]: {result}\033[0m")
+    print(f"\033[35m[Subagent done]\033[0m")
+    return result
+ 
+
+TOOL_HANDLERS["task"] = spawn_subagent
+# ═══════════════════════════════════════════════════════════
+#  agent_loop — same as s04 + nag reminder counter
 # ═══════════════════════════════════════════════════════════
 
 rounds_since_todo = 0
@@ -318,7 +311,7 @@ rounds_since_todo = 0
 def agent_loop(messages: list):
     global rounds_since_todo
     while True:
-        # s05: nag reminder
+        # s05: nag reminder — inject if model hasn't updated todos for 3 rounds
         if rounds_since_todo >= 3 and messages:
             messages.append({"role": "user",
                              "content": "<reminder>Update your todos.</reminder>"})
@@ -354,6 +347,7 @@ def agent_loop(messages: list):
 
             trigger_hooks("PostToolUse", block, output)
 
+            # s05: reset nag counter when todo_write is called
             if block.name == "todo_write":
                 rounds_since_todo = 0
 
@@ -364,13 +358,13 @@ def agent_loop(messages: list):
 
 
 if __name__ == "__main__":
-    print("s06: Subagent — spawn sub-agents with fresh context, summary only")
+    print("s05: TodoWrite — plan before execute, nag if you forget")
     print("Type a question, press Enter. Type q to quit.\n")
 
     history = []
     while True:
         try:
-            query = input("\033[36ms06 >> \033[0m")
+            query = input("\033[36ms05 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", ""):

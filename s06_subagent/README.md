@@ -127,6 +127,39 @@ python s06_subagent/code.py
 
 观察重点：是否出现 `[Subagent spawned]` / `[Subagent done]`？子 Agent 的工具调用是否以 `[sub] ...` 输出？主 Agent 最后是否只继续处理子 Agent 返回的摘要？
 
+Note20260718:
+1. 实现细节：(1) subagent超过loop limit（30），需要返回最后的assistant的message
+2. 运行`code_s05.py`跑`Use a subtask to find what testing framework this project uses`发现主agent会继续处理子agent的摘要，以更精简方式描述，然后引用了subagent summary
+
+```
+# subagent的summary，更详细
+[Subagent result]: ## Summary
+...
+### 1. **pytest**
+...
+### 2. **unittest** (Python standard library)
+...
+### Test Files
+...
+### Web (Next.js) Frontend
+...
+[Subagent done]
+
+[HOOK] Stop: session used 1 tool calls
+
+# 主agent输出，较简略
+## Results
+
+The project at `/home/luowanqian/project/learn-claude-code` uses **two Python testing frameworks**:
+
+1. **pytest** – used in `tests/test_agents_smoke.py` (with `@pytest.mark.parametrize`)
+2. **unittest** (Python standard library) – used in the other three test files
+
+The `web/` directory (a Next.js app) has **no testing framework configured**.
+
+See the sub-task summary above for full details.    # 这里ref了subagent输出
+```
+
 ---
 
 ## 接下来
