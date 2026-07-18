@@ -133,6 +133,24 @@ python s07_skill_loading/code.py
 
 ---
 
+Note20260718:
+
+1. 要让LLM使用skill，需要明确先加载skill，再告诉LLM让其根据skill中的instruction去执行。比如prompt 2，要让LLM review `s07_skill_loading`的代码，成功率较高的prompt写法是：
+
+```
+Load the code-review skill and follow its instructions to review the code in s07_skill_loading
+```
+
+直接使用review指令，当前LLM不会强制加载skill
+
+```
+review the code in s07_skill_loading
+```
+
+思考：为啥需要明确的指令才能加载？当前实现把skill description都加载到了system prompt，但是还是需要明确指令才能加载
+
+---
+
 ## 接下来
 
 按需加载解决了"不该带的不要带"。但另一个问题来了：Agent 连续工作 30 分钟后，messages 列表塞满了中间过程。旧的 tool_result、过时的文件内容，占着上下文但不产生价值。

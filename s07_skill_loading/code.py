@@ -332,7 +332,7 @@ def permission_hook(block):
     return None
 
 def log_hook(block):
-    print(f"\033[90m[HOOK] {block.name}\033[0m")
+    print(f"\033[90m[HOOK] {block.name}({block.input})\033[0m")
     return None
 
 def context_inject_hook(query: str):
