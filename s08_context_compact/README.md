@@ -218,6 +218,10 @@ python s08_context_compact/code.py
 
 观察重点：每次工具执行后，旧 tool_result 是否被压缩？连续对话后 token 超阈值时，是否自动触发了摘要？
 
+Note20260719:
+
+1. 执行发现，LLM的返回Function调用参数会不匹配tool schema现象，例如调用`run_bash`会多传入`timeout`参数。当前调用的模型是DeepSeek v4 flash，从官方文档可知tool call默认是非strict模式，会出现这种不匹配现象，这里给tool函数加了kwargs
+
 ---
 
 ## 接下来

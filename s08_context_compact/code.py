@@ -126,14 +126,14 @@ def safe_path(p: str) -> Path:
     if not path.is_relative_to(WORKDIR): raise ValueError(f"Path escapes workspace: {p}")
     return path
 
-def run_bash(command: str) -> str:
+def run_bash(command: str, **kwargs) -> str:
     try:
         r = subprocess.run(command, shell=True, cwd=WORKDIR, capture_output=True, text=True, timeout=120)
         out = (r.stdout + r.stderr).strip()
         return out[:50000] if out else "(no output)"
     except subprocess.TimeoutExpired: return "Error: Timeout (120s)"
 
-def run_read(path: str, limit: int | None = None) -> str:
+def run_read(path: str, limit: int | None = None, **kwargs) -> str:
     try:
         lines = safe_path(path).read_text().splitlines()
         if limit and limit < len(lines): lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
@@ -438,7 +438,7 @@ def permission_hook(block):
             if p in block.input.get("command", ""): return "Permission denied"
     return None
 def log_hook(block):
-    print(f"\033[90m[HOOK] {block.name}\033[0m")
+    print(f"\033[90m[HOOK] {block.name}({block.input})\033[0m")
     return None
 
 HOOKS["PreToolUse"].append(permission_hook)
